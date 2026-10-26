@@ -1,0 +1,145 @@
+rules_version = '2';
+
+// BillSplatter: Firestore holds user profiles, friend links/requests, expenses being handed
+// between linked friends, and groups shared between app users. Each account's own copy of its
+// groups and expenses lives on the REST backend.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // True when the user has proven they own their login email (clicked the verification link).
+    function emailVerified() {
+      return request.auth.token.email != null
+          && request.auth.token.email_verified == true;
+    }
+
+    // The sender's email on a request or invite is empty, or their own verified login email, so it
+    // can't be faked. (Guests and anonymous Firebase logins have no email.)
+    function fromEmailIsMine() {
+      return request.resource.data.fromEmail == ''
+          || (emailVerified() && request.resource.data.fromEmail == request.auth.token.email.lower());
+    }
+
+    function invite(id) {
+      return get(/databases/$(database)/documents/invites/$(id)).data;
+    }
+
+    // Everything under users/{uid} (profile, links) belongs to that user alone.
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+      match /{document=**} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // Lets someone look up ONE exact email (get) without being able to list users.
+    // Only the verified owner of that email address can create or change its entry.
+    match /emailIndex/{email} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if signedIn()
+          && request.resource.data.uid == request.auth.uid
+          && emailVerified()
+          && email == request.auth.token.email.lower();
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // An invite link (https://<host>/invite/<id>). The random id is the secret: anyone signed in
+    // who has the link may read that one invite, nobody can list them.
+    match /invites/{inviteId} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+          && request.resource.data.fromUid == request.auth.uid
+          && request.resource.data.fromName is string
+          && fromEmailIsMine();
+      allow delete: if signedIn() && resource.data.fromUid == request.auth.uid;
+    }
+
+    // Friend requests are readable only by the two people involved.
+    match /friendRequests/{requestId} {
+      allow read: if signedIn()
+          && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
+
+      allow create: if signedIn() && (
+          // Sent in the app, waiting for the receiver.
+          (request.resource.data.fromUid == request.auth.uid
+            && request.resource.data.toUid != request.auth.uid
+            && requestId == request.auth.uid + '_' + request.resource.data.toUid
+            && request.resource.data.status == 'pending'
+            && fromEmailIsMine())
+          ||
+          // Accepted by whoever opened the sender's invite link. The sender's details must be the
+          // invite's own, so an invite can't be turned into a request from someone else.
+          (request.resource.data.toUid == request.auth.uid
+            && request.resource.data.fromUid != request.auth.uid
+            && requestId == request.resource.data.fromUid + '_' + request.auth.uid
+            && request.resource.data.status == 'accepted'
+            && request.resource.data.inviteId is string
+            && exists(/databases/$(database)/documents/invites/$(request.resource.data.inviteId))
+            && invite(request.resource.data.inviteId).fromUid == request.resource.data.fromUid
+            && invite(request.resource.data.inviteId).fromEmail == request.resource.data.fromEmail
+            && invite(request.resource.data.inviteId).get('friendId', null) == request.resource.data.get('friendId', null))
+        );
+
+      allow update: if signedIn() && (
+          // The receiver answers: only status (and their name) may change.
+          (resource.data.toUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'toName'])
+            && request.resource.data.status in ['accepted', 'declined'])
+          ||
+          // The sender may ask again after a decline.
+          (resource.data.fromUid == request.auth.uid
+            && resource.data.status == 'declined'
+            && request.resource.data.status == 'pending'
+            && request.resource.data.fromUid == request.auth.uid
+            && request.resource.data.toUid == resource.data.toUid
+            && fromEmailIsMine())
+        );
+
+      // The sender removes a request once it has been dealt with.
+      allow delete: if signedIn() && resource.data.fromUid == request.auth.uid;
+    }
+
+    // An expense handed from one linked friend to the other. The receiver's app only saves it
+    // when the sender is an accepted friend, then deletes the doc.
+    match /sharedExpenses/{id} {
+      allow create: if signedIn()
+          && request.resource.data.fromUid == request.auth.uid
+          && request.resource.data.toUid != request.auth.uid
+          && request.resource.data.amountCents is int
+          && request.resource.data.oweCents is int
+          && request.resource.data.oweCents > 0
+          && request.resource.data.oweCents <= request.resource.data.amountCents;
+      allow read, delete: if signedIn()
+          && (resource.data.fromUid == request.auth.uid || resource.data.toUid == request.auth.uid);
+    }
+
+    // A group shared between app users (see GroupSync.kt). Every member's phone mirrors it into
+    // their own backend account. Only the app users in memberUids can see or change it; the
+    // creator makes it, and only the creator may mark it deleted for everyone.
+    function groupMember(groupId) {
+      return request.auth.uid in get(/databases/$(database)/documents/sharedGroups/$(groupId)).data.memberUids;
+    }
+
+    match /sharedGroups/{groupId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.memberUids;
+      allow create: if signedIn()
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.auth.uid in request.resource.data.memberUids
+          && request.resource.data.deleted == false;
+      allow update: if signedIn()
+          && request.auth.uid in resource.data.memberUids
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && (request.resource.data.deleted == resource.data.deleted || resource.data.ownerUid == request.auth.uid);
+      allow delete: if false;
+
+      match /expenses/{expenseId} {
+        allow read, write: if signedIn() && groupMember(groupId);
+      }
+    }
+  }
+}
